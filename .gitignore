@@ -1,0 +1,10 @@
+node_modules/
+.env
+*.log
+coverage/
+
+# Contiene las contraseñas de prueba del seed: se comparte fuera del repositorio
+docs/Tranky_Guia_Pruebas.pdf
+
+# Archivos de trabajo de las pruebas manuales con REST Client
+tests/*.xlsx

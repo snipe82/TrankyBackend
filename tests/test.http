@@ -1,0 +1,690 @@
+# =============================================================================
+#  Tranky API – pruebas manuales con REST Client (extensión de VS Code / Cursor)
+# =============================================================================
+#  Cómo usarlo
+#   1. Instala la extensión "REST Client" (humao.rest-client).
+#   2. Deja la API corriendo: npm run dev
+#   3. Para empezar desde datos limpios: npm run db:reset
+#   4. Haz clic en "Send Request" sobre cada petición, EN ORDEN de arriba hacia abajo:
+#      varias peticiones reutilizan la respuesta de una anterior (token, ids de cuotas, etc.).
+#
+#  Las contraseñas no están en este archivo: se leen con {{$dotenv ...}} del .env de la raíz
+#  del proyecto (REST Client lo busca subiendo desde la carpeta tests/).
+#  Los IDs fijos (edificios, unidades, pagadores) son los que crea el seed.
+# =============================================================================
+
+@host = http://localhost:{{$dotenv PORT}}
+@api = {{host}}/api/v1
+
+# IDs fijos del seed
+@edificioPinos = b1000000-0000-4000-8000-000000000001
+@dpto402 = c1000000-0000-4000-8000-000000000402
+@deposito12 = c1000000-0000-4000-8000-000000000012
+@cochera07 = c1000000-0000-4000-8000-000000000007
+@dpto501 = c1000000-0000-4000-8000-000000000501
+@dpto1201 = c2000000-0000-4000-8000-000000001201
+@pagadorCarla = d0000000-0000-4000-8000-000000000003
+
+# Llave fija para demostrar la idempotencia (reutilízala solo en las peticiones 4.1 y 4.2)
+@idemReplay = rest-client-replay-0001
+
+
+###############################################################################
+# 0. SALUD
+###############################################################################
+
+### 0.1 Health check
+GET {{host}}/health
+
+
+###############################################################################
+# 1. AUTENTICACIÓN DEL RESIDENTE (RF-R-01)
+###############################################################################
+
+### 1.1 Login de Juan (propietario de 4 unidades) con contraseña
+# @name loginJuan
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{
+  "tipo_doc": "DNI",
+  "num_doc": "45678901",
+  "password": "{{$dotenv SEED_PASSWORD_RESIDENTES}}"
+}
+
+### 1.2 Login de María (inquilina del DPTO-402)
+# @name loginMaria
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{
+  "tipo_doc": "DNI",
+  "num_doc": "41234567",
+  "password": "{{$dotenv SEED_PASSWORD_RESIDENTES}}"
+}
+
+### 1.3 Solicitar OTP por WhatsApp para Carla (en desarrollo devuelve dev_otp)
+# @name otpCarla
+POST {{api}}/auth/otp
+Content-Type: application/json
+
+{
+  "tipo_doc": "DNI",
+  "num_doc": "47890123",
+  "canal": "WHATSAPP"
+}
+
+### 1.4 Login de Carla con el OTP recibido
+# @name loginCarla
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{
+  "tipo_doc": "DNI",
+  "num_doc": "47890123",
+  "otp": "{{otpCarla.response.body.$.dev_otp}}"
+}
+
+### 1.5 Error: contraseña incorrecta (401, mensaje genérico)
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{
+  "tipo_doc": "DNI",
+  "num_doc": "45678901",
+  "password": "contraseña-incorrecta"
+}
+
+### 1.6 Error: validación (DNI corto y sin contraseña ni OTP)
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{
+  "tipo_doc": "DNI",
+  "num_doc": "123"
+}
+
+
+###############################################################################
+# 2. CONSULTAS DEL RESIDENTE (RF-R-02 a RF-R-06)
+###############################################################################
+
+### 2.1 Selector de unidades (agrupadas por edificio y tipo)
+GET {{api}}/payer/units
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 2.2 Mis propiedades con saldos, subtotales y total general
+GET {{api}}/payer/properties
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 2.3 Dashboard consolidado de deuda
+GET {{api}}/payer/debts?scope=all
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 2.4 Dashboard de una sola unidad
+GET {{api}}/payer/debts?unit_id={{dpto402}}
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 2.5 Cuotas del DPTO-402 (las 2 primeras están vencidas; la [3] es extraordinaria)
+# @name deudas402
+GET {{api}}/payer/units/{{dpto402}}/debts
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 2.6 Cuotas pagadas de una unidad (filtro por estado)
+GET {{api}}/payer/units/{{dpto402}}/debts?status=PAGADO
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 2.7 Aviso de cobranza en PDF (usa la primera cuota del DPTO-402)
+GET {{api}}/payer/debts/{{deudas402.response.body.$.cuotas[0].id}}/notice.pdf
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 2.8 María (inquilina) ve solo las cuotas ordinarias del DPTO-402
+GET {{api}}/payer/units/{{dpto402}}/debts
+Authorization: Bearer {{loginMaria.response.body.$.token}}
+
+### 2.9 Reportar un dato incorrecto de la cochera
+POST {{api}}/payer/units/{{cochera07}}/data-issues
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "descripcion": "El área de la cochera es 13 m², no 12.5 m²"
+}
+
+### 2.10 Error: sin token (401)
+GET {{api}}/payer/units
+
+
+###############################################################################
+# 3. BILLETERA DE TARJETAS (RF-R-11, RF-R-12)
+###############################################################################
+
+### 3.1 Agregar tarjeta tokenizada con débito automático
+# @name tarjetaNueva
+POST {{api}}/payer/payment-methods
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "token_id": "tkn_visa_rest_client_0001",
+  "marca": "VISA",
+  "ultimos_4_digitos": "4242",
+  "debito_automatico_activo": true
+}
+
+### 3.2 Listar tarjetas
+GET {{api}}/payer/payment-methods
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 3.3 Marcar como predeterminada
+PATCH {{api}}/payer/payment-methods/{{tarjetaNueva.response.body.$.id}}
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "es_predeterminado": true
+}
+
+### 3.4 Error: nunca se acepta un número de tarjeta en lugar del token (400)
+POST {{api}}/payer/payment-methods
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "token_id": "4111111111111111",
+  "ultimos_4_digitos": "1111"
+}
+
+### 3.5 Eliminar sin confirmar: pide confirmación porque tiene débito automático (409)
+DELETE {{api}}/payer/payment-methods/{{tarjetaNueva.response.body.$.id}}
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 3.6 Eliminar confirmando
+DELETE {{api}}/payer/payment-methods/{{tarjetaNueva.response.body.$.id}}?confirmar=true
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+
+###############################################################################
+# 4. CHECKOUT CON YAPE + CONFIRMACIÓN POR WEBHOOK (RF-R-07, RF-R-08, RF-R-13)
+###############################################################################
+
+### 4.1 Pagar las 2 cuotas vencidas del DPTO-402 con Yape -> 202 EN_PROCESO
+# Ejecuta antes la 2.5 (deudas402). El backend ignora cualquier monto enviado.
+# @name pagoYape
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{idemReplay}}
+
+{
+  "debt_ids": [
+    "{{deudas402.response.body.$.cuotas[0].id}}",
+    "{{deudas402.response.body.$.cuotas[1].id}}"
+  ],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "987654321", "otp": "123456" }
+}
+
+### 4.2 Idempotencia: misma llave y mismo cuerpo -> devuelve el mismo pago, no cobra dos veces
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{idemReplay}}
+
+{
+  "debt_ids": [
+    "{{deudas402.response.body.$.cuotas[0].id}}",
+    "{{deudas402.response.body.$.cuotas[1].id}}"
+  ],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "987654321", "otp": "123456" }
+}
+
+### 4.3 Error: misma cuota con otra llave mientras está EN_PROCESO (409 DEBT_IN_PROCESS)
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "debt_ids": ["{{deudas402.response.body.$.cuotas[0].id}}"],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "987654321", "otp": "123456" }
+}
+
+### 4.4 Error: checkout sin Idempotency-Key (400)
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "debt_ids": ["{{deudas402.response.body.$.cuotas[2].id}}"],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "987654321", "otp": "123456" }
+}
+
+### 4.5 Estado del pago (polling) -> EN_PROCESO
+GET {{api}}/payments/{{pagoYape.response.body.$.transaction_id}}/status
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 4.6 [DEV] Simular el webhook de la pasarela: pago confirmado
+POST {{api}}/dev/mock-gateway/transactions/{{pagoYape.response.body.$.transaction_id}}/succeed
+
+### 4.7 Estado del pago -> PAGADO
+GET {{api}}/payments/{{pagoYape.response.body.$.transaction_id}}/status
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 4.8 Historial de pagos del DPTO-402 con total histórico
+GET {{api}}/payer/units/{{dpto402}}/transactions
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 4.9 Historial consolidado filtrado por año
+GET {{api}}/payer/transactions?year=2026&page=1&page_size=10
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 4.10 Comprobante de recaudación en PDF
+GET {{api}}/payer/transactions/{{pagoYape.response.body.$.transaction_id}}/receipt.pdf
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 4.11 María (inquilina) no ve ese pago: su historial es solo de sus propios pagos
+GET {{api}}/payer/units/{{dpto402}}/transactions
+Authorization: Bearer {{loginMaria.response.body.$.token}}
+
+### 4.12 Error: María intenta pagar la cuota extraordinaria (404, no es visible para su rol)
+# La [3] de deudas402 es la cuota extraordinaria.
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginMaria.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "debt_ids": ["{{deudas402.response.body.$.cuotas[3].id}}"],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "912345678", "otp": "123456" }
+}
+
+
+###############################################################################
+# 5. OTROS MEDIOS DE PAGO Y RECHAZOS (RF-R-08 a RF-R-10)
+###############################################################################
+
+### 5.1 Cuotas de la cochera
+# @name deudasCochera
+GET {{api}}/payer/units/{{cochera07}}/debts
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 5.2 Yape rechazado (OTP 000000 en la pasarela simulada) -> 402, la cuota se libera
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "debt_ids": ["{{deudasCochera.response.body.$.cuotas[0].id}}"],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "987654321", "otp": "000000" }
+}
+
+### 5.3 Error: OTP de Yape con 5 dígitos (400)
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "debt_ids": ["{{deudasCochera.response.body.$.cuotas[0].id}}"],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "987654321", "otp": "12345" }
+}
+
+### 5.4 Tarjeta nueva que exige 3DS (token tkn_3ds...) y se guarda en la billetera -> 202 con next_action
+# @name pagoTarjeta
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "debt_ids": ["{{deudasCochera.response.body.$.cuotas[0].id}}"],
+  "metodo_pago": "CARD",
+  "card": {
+    "token_id": "tkn_3ds_mastercard_rest_0002",
+    "guardar": true,
+    "marca": "MASTERCARD",
+    "ultimos_4_digitos": "5454"
+  }
+}
+
+### 5.5 [DEV] Simular rechazo de la pasarela -> FALLIDO y cuota liberada
+POST {{api}}/dev/mock-gateway/transactions/{{pagoTarjeta.response.body.$.transaction_id}}/fail
+Content-Type: application/json
+
+{
+  "motivo": "Fondos insuficientes"
+}
+
+### 5.6 Estado del pago con tarjeta -> FALLIDO
+GET {{api}}/payments/{{pagoTarjeta.response.body.$.transaction_id}}/status
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 5.7 Cuotas del depósito
+# @name deudasDeposito
+GET {{api}}/payer/units/{{deposito12}}/debts
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 5.8 Generar código CIP / QR (vigencia 24 h) -> 202 con cip.codigo
+# @name pagoCip
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "debt_ids": ["{{deudasDeposito.response.body.$.cuotas[0].id}}"],
+  "metodo_pago": "CIP"
+}
+
+### 5.9 [DEV] El residente paga el CIP en su banco: confirmar por webhook
+POST {{api}}/dev/mock-gateway/transactions/{{pagoCip.response.body.$.transaction_id}}/succeed
+
+### 5.10 Cuotas del DPTO-1201 (otro edificio y otra administradora)
+# @name deudas1201
+GET {{api}}/payer/units/{{dpto1201}}/debts
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+### 5.11 Error: no se pueden mezclar cuotas de edificios distintos (422 MIXED_CHECKOUT)
+POST {{api}}/payments/checkout
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "debt_ids": [
+    "{{deudasCochera.response.body.$.cuotas[0].id}}",
+    "{{deudas1201.response.body.$.cuotas[0].id}}"
+  ],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "987654321", "otp": "123456" }
+}
+
+
+###############################################################################
+# 6. LINK DE PAGO DE WHATSAPP (RF-R-14)
+###############################################################################
+
+### 6.1 Cuotas de Carla (DPTO-501)
+# @name deudasCarla
+GET {{api}}/payer/units/{{dpto501}}/debts
+Authorization: Bearer {{loginCarla.response.body.$.token}}
+
+### 6.2 [DEV] Generar el link que llegaría por WhatsApp
+# @name linkCarla
+POST {{api}}/dev/pay-links
+Content-Type: application/json
+
+{
+  "debt_id": "{{deudasCarla.response.body.$.cuotas[0].id}}",
+  "payer_id": "{{pagadorCarla}}"
+}
+
+### 6.3 Abrir el link (público, sin login) -> datos de la cuota + checkout_token de 15 min
+# @name resolverLink
+GET {{api}}/payer/pay-links/{{linkCarla.response.body.$.token}}
+
+### 6.4 Pagar con el checkout_token del link
+# @name pagoLink
+POST {{api}}/payments/checkout
+Authorization: Bearer {{resolverLink.response.body.$.checkout_token}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "debt_ids": ["{{resolverLink.response.body.$.cuota.id}}"],
+  "metodo_pago": "YAPE",
+  "yape": { "celular": "998877665", "otp": "123456" }
+}
+
+### 6.5 Error: el token del link no da acceso al resto del portal (403)
+GET {{api}}/payer/units
+Authorization: Bearer {{resolverLink.response.body.$.checkout_token}}
+
+### 6.6 [DEV] Confirmar el pago del link
+POST {{api}}/dev/mock-gateway/transactions/{{pagoLink.response.body.$.transaction_id}}/succeed
+
+### 6.7 El link ya fue usado -> 410 PAY_LINK_EXPIRED
+GET {{api}}/payer/pay-links/{{linkCarla.response.body.$.token}}
+
+
+###############################################################################
+# 7. PORTAL DE LA ADMINISTRADORA (RF-S-01 a RF-S-05)
+###############################################################################
+
+### 7.1 Login de la administradora Tranquila
+# @name loginAdmin
+POST {{api}}/auth/admin/login
+Content-Type: application/json
+
+{
+  "email": "admin@tranquila.pe",
+  "password": "{{$dotenv SEED_PASSWORD_ADMIN}}"
+}
+
+### 7.2 Edificios
+GET {{api}}/tenant/organization-units
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.3 Configurar reglas del edificio (mora y permisos por rol)
+PATCH {{api}}/tenant/organization-units/{{edificioPinos}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "config_json": {
+    "mora": { "tipo": "INTERES_DIARIO", "valor": 0.1, "dias_gracia": 3, "tope": 50 },
+    "permisos_cuota": {
+      "INQUILINO": { "ver": ["ORDINARIA"], "pagar": ["ORDINARIA"], "historial": "PROPIOS" }
+    }
+  }
+}
+
+### 7.4 Crear un edificio
+POST {{api}}/tenant/organization-units
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "nombre": "Residencial Los Pinos – Torre B",
+  "direccion": "Av. Javier Prado Este 1240, San Isidro",
+  "moneda_base": "PEN",
+  "config_json": { "mora": { "tipo": "PENALIDAD_FIJA", "valor": 15, "dias_gracia": 0, "tope": null } }
+}
+
+### 7.5 Unidades del tenant (filtro opcional por edificio y tipo)
+GET {{api}}/tenant/units?organization_unit_id={{edificioPinos}}&tipo_unidad=COCHERA
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.6 Crear una cochera
+# @name nuevaCochera
+POST {{api}}/tenant/units
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "organization_unit_id": "{{edificioPinos}}",
+  "tipo_unidad": "COCHERA",
+  "codigo_interno": "COCH-S2-{{$randomInt 10 99}}",
+  "alias": "Cochera de visitas",
+  "metadata_json": { "nivel": "S2", "numero": "08", "techada": false, "area_m2": 12.5, "alicuota": 0.3 }
+}
+
+### 7.7 Editar la cochera
+PATCH {{api}}/tenant/units/{{nuevaCochera.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "alias": "Cochera 08",
+  "metadata_json": { "techada": true }
+}
+
+### 7.8 Error: tipo de unidad no reconocido (422)
+POST {{api}}/tenant/units
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "organization_unit_id": "{{edificioPinos}}",
+  "tipo_unidad": "BAULERA",
+  "codigo_interno": "BAU-01"
+}
+
+### 7.9 Residentes del tenant con sus vínculos
+GET {{api}}/tenant/payers
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.10 Vincular un inquilino nuevo a la cochera recién creada
+# @name relacion
+POST {{api}}/tenant/unit-relations
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "billing_unit_id": "{{nuevaCochera.response.body.$.id}}",
+  "rol": "INQUILINO",
+  "pagador": {
+    "tipo_doc": "DNI",
+    "num_doc": "48887776",
+    "nombres": "Pedro",
+    "apellidos": "Salazar Ruiz",
+    "email": "pedro.salazar@example.com",
+    "telefono_whatsapp": "976543210"
+  }
+}
+
+### 7.11 Fin del arrendamiento: desactivar el vínculo
+POST {{api}}/tenant/unit-relations/{{relacion.response.body.$.id}}/deactivate
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.12 Emisión masiva por alícuota (departamentos) -> crea cuotas y encola avisos
+POST {{api}}/tenant/debts/generate
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "organization_unit_id": "{{edificioPinos}}",
+  "periodo": "2026-11",
+  "concepto_principal": "Mantenimiento 2026-11",
+  "tipo_cuota": "ORDINARIA",
+  "fecha_vencimiento": "2026-11-30",
+  "modo_calculo": "ALICUOTA",
+  "tipos_unidad": ["DEPARTAMENTO"],
+  "items": [
+    { "item": "Gastos comunes", "monto": 15000 },
+    { "item": "Fondo de reserva", "monto": 5000 }
+  ],
+  "enviar_avisos": true
+}
+
+### 7.13 Emisión por monto fijo para depósitos y cocheras (ejecútala dos veces: la segunda no duplica)
+POST {{api}}/tenant/debts/generate
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "organization_unit_id": "{{edificioPinos}}",
+  "periodo": "2026-11",
+  "concepto_principal": "Mantenimiento 2026-11",
+  "fecha_vencimiento": "2026-11-30",
+  "modo_calculo": "MONTO_FIJO",
+  "tipos_unidad": ["DEPOSITO", "COCHERA"],
+  "items": [{ "item": "Mantenimiento", "monto": 35 }]
+}
+
+### 7.14 Monitor: cuotas del periodo
+GET {{api}}/tenant/debts?organization_unit_id={{edificioPinos}}&periodo=2026-11&page=1&page_size=20
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.15 Monitor: transacciones exitosas
+GET {{api}}/tenant/transactions?estado=EXITOSO&page=1&page_size=20
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.16 KPIs del edificio
+GET {{api}}/tenant/dashboard/kpis?organization_unit_id={{edificioPinos}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.17 KPIs de un periodo
+GET {{api}}/tenant/dashboard/kpis?organization_unit_id={{edificioPinos}}&periodo=2026-10
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.18 Reportes de datos incorrectos enviados por residentes
+GET {{api}}/tenant/data-issues?estado=ABIERTO
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.19 Liquidaciones (hoy vacío: motor pendiente)
+GET {{api}}/tenant/settlements
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.20 Descargar la plantilla del padrón (.xlsx)
+# REST Client muestra el binario; para guardarlo usa el ícono "Save Response" del panel de respuesta.
+GET {{api}}/tenant/units/bulk-import/template
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 7.21 Importar padrón: solo validar (no guarda nada)
+# Guarda la plantilla de la 7.20 como "plantilla-padron.xlsx" en la carpeta tests/ (junto a este archivo).
+# Cambia modo=validar por modo=confirmar para aplicarla.
+POST {{api}}/tenant/units/bulk-import?organization_unit_id={{edificioPinos}}&modo=validar
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: multipart/form-data; boundary=TrankyBoundary
+
+--TrankyBoundary
+Content-Disposition: form-data; name="archivo"; filename="plantilla-padron.xlsx"
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+
+< ./plantilla-padron.xlsx
+--TrankyBoundary--
+
+
+###############################################################################
+# 8. AISLAMIENTO ENTRE ADMINISTRADORAS Y PERMISOS
+###############################################################################
+
+### 8.1 Login de la administradora Lima Norte (otro tenant)
+# @name loginAdminLimaNorte
+POST {{api}}/auth/admin/login
+Content-Type: application/json
+
+{
+  "email": "admin@limanorte.pe",
+  "password": "{{$dotenv SEED_PASSWORD_ADMIN}}"
+}
+
+### 8.2 Solo ve sus propias unidades (DPTO-1201)
+GET {{api}}/tenant/units
+Authorization: Bearer {{loginAdminLimaNorte.response.body.$.token}}
+
+### 8.3 Error: intenta editar una unidad de otra administradora (404)
+PATCH {{api}}/tenant/units/{{dpto402}}
+Authorization: Bearer {{loginAdminLimaNorte.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "alias": "intento no permitido"
+}
+
+### 8.4 Error: un residente no puede usar el portal B2B (403)
+GET {{api}}/tenant/units
+Authorization: Bearer {{loginJuan.response.body.$.token}}
+
+
+###############################################################################
+# 9. HERRAMIENTAS DE DESARROLLO (solo con ENABLE_DEV_ROUTES=true)
+###############################################################################
+
+### 9.1 Recalcular mora ahora (normalmente corre a las 00:01)
+POST {{api}}/dev/jobs/mora
+
+### 9.2 Liberar pagos y CIP vencidos ahora (normalmente cada minuto)
+POST {{api}}/dev/jobs/expiracion
+
+### 9.3 Enviar la cola de notificaciones ahora (se ven en la consola de npm run dev)
+POST {{api}}/dev/jobs/notificaciones
